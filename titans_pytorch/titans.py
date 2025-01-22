@@ -73,7 +73,7 @@ def round_down_multiple(seq, mult):
     return seq // mult * mult
 
 
-def round_up_multiple(seq, mult):
+def round_up_multiple(seq: int, mult: int):
     return math.ceil(seq / mult) * mult
 
 
@@ -698,9 +698,12 @@ class NeuralMemory(Module):
         return updates, aux_kv_recon_loss.mean()
 
     def retrieve_memories(
-        self, seq, past_weights: dict[str, Tensor] | None = None, chunk_size=None
+        self,
+        seq: Tensor,
+        past_weights: dict[str, Tensor] | None = None,
+        chunk_size: int | None = None,
     ):
-        chunk_size = default(chunk_size, self.retrieve_chunk_size)
+        chunk_size = chunk_size if chunk_size is not None else self.retrieve_chunk_size
         batch, seq_len = seq.shape[:2]
 
         seq = self.retrieve_norm(seq)
@@ -736,7 +739,6 @@ class NeuralMemory(Module):
         queries = self.split_heads(queries)
 
         # fetch values from memory model
-
         curr_weights = curr_weights.apply(
             lambda t: rearrange(t, "b n ... -> (b n) ...")
         )

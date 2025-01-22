@@ -8,25 +8,22 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 """
 
 import functools
-import chex
 import math
-import inspect
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal, Mapping
-import optax
-from optax import softmax_cross_entropy_with_integer_labels
-import torch
-import torch.nn as nn
-from torch.nn import functional as F
-from flax import nnx
-import jax.numpy as jnp
+from typing import Any, Callable, Iterable, Literal, Mapping
+
+import chex
 import jax
-from einops import rearrange, unpack
-from jaxtyping import Float, PyTree, Int, jaxtyped
 import jax.nn
+import jax.numpy as jnp
+import optax
+import torch
 
 # from typeguard import typechecked as type_checker
 from beartype import beartype as type_checker
+from einops import pack, rearrange
+from flax import nnx
+from jaxtyping import Float, Int, jaxtyped
 
 type seq_len = int
 type hidden_dim = int
@@ -92,8 +89,8 @@ class CausalSelfAttention(nnx.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         combined_out = self.c_attn(x)
-        # q, k, v = rearrange(combined_out, "B seq_len (3 hs) -> 3 B seq_len hs")
-        q, k, v = jnp.split(combined_out, self.n_embd, axis=2)
+        # NOTE: differs from torch where we provide the size of each split, here we give the number of splits.
+        q, k, v = jnp.split(combined_out, 3, axis=2)
 
         split_heads = functools.partial(
             rearrange,
@@ -265,9 +262,9 @@ class GPT(nnx.Module):
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer_wte.embedding = (
-            self.lm_head.kernel
-        )  # https://paperswithcode.com/method/weight-tying
+        # self.transformer_wte.embedding = (
+        #     self.lm_head.kernel.T  # note: extra transpose which is different from torch.
+        # )  # https://paperswithcode.com/method/weight-tying
 
         # todo: init all weights
         # self.apply(self._init_weights)
@@ -280,18 +277,19 @@ class GPT(nnx.Module):
         #         )
 
         # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
     def parameters(self) -> Iterable[nnx.Param[jax.Array]]:
-        params = nnx.state(self)
-        yield from jax.tree.leaves(params)
+        yield from self.state_dict().values()
 
     def named_parameters(self) -> Iterable[tuple[str, nnx.Param]]:
-        state = nnx.state(self, nnx.Param)
-        yield from flatten(state).items()  # type: ignore
+        yield from self.state_dict().items()
 
-    def state_dict(self) -> dict[str, jax.Array]:
-        return flatten(nnx.state(self, nnx.State))
+    def state_dict(self) -> dict[str, nnx.Param]:
+        return {
+            ".".join(map(str, keys)): v
+            for keys, v in nnx.variables(self, nnx.Param).flat_state().items()
+            if v.value is not None
+        }  # type: ignore
 
     def get_num_params(self, non_embedding=True) -> int:
         """
@@ -308,24 +306,23 @@ class GPT(nnx.Module):
         assert isinstance(n_params, int)
         return n_params
 
-    @chex.chexify
     @jaxtyped(typechecker=type_checker)
     def __call__(
         self,
         idx: Int[jax.Array, "B seq_len"],
-        targets: Int[jax.Array, " B"] | None = None,
+        targets: Int[jax.Array, "B seq_len"] | None = None,
     ):
         b, t = idx.shape
         assert (
             t <= self.config.block_size
         ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = jnp.arange(0, t, dtype=jnp.int64)  # shape (t)
+        pos = jnp.arange(0, t, dtype=int)  # shape (t)
 
         # forward the GPT model itself
         tok_emb = self.transformer_wte(idx)  # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer_wpe(pos)  # position embeddings of shape (t, n_embd)
         chex.assert_shape(tok_emb, (b, t, self.config.n_embd))
-        assert False, (tok_emb.shape, pos_emb.shape)
+        chex.assert_shape(pos_emb, (t, self.config.n_embd))
         x = self.transformer_drop(
             tok_emb + rearrange(pos_emb, "T n_embd -> 1 T n_embd")
         )
@@ -336,10 +333,12 @@ class GPT(nnx.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            targets = rearrange(targets, "B seq_len -> (B seq_len)")
             loss = optax.softmax_cross_entropy_with_integer_labels(
                 rearrange(logits, "B seq_len vocab_size -> (B seq_len) vocab_size"),
-                targets.reshape(-1),
-                where=targets != -1,
+                targets,
+                # targets.reshape(-1),
+                # where=targets != -1,  # TODO: Re-enable this!
             )
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -356,9 +355,7 @@ class GPT(nnx.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer_wpe.embedding = nnx.Param(
-            self.transformer_wpe.embedding[:block_size]
-        )
+        self.transformer_wpe.embedding = self.transformer_wpe.embedding[:block_size]
         for block in self.transformer_h:
             if block.attn.mask is not None:
                 block.attn.mask = block.attn.mask[:, :, :block_size, :block_size]
@@ -504,18 +501,30 @@ class GPT(nnx.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    # @torch.no_grad()
+    def generate(
+        self,
+        idx: Int[jax.Array, "B seq_len"],
+        max_new_tokens: int,
+        key: chex.PRNGKey,
+        temperature: float = 1.0,
+        top_k=None,
+    ):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
+
+        # todo: use jax.lax.while_loop to make this more efficient and jit-able, as done here:
+        # https://github.com/google/flax/blob/main/examples/lm1b/temperature_sampler.py#L27
+
+        for i in range(max_new_tokens):
+            key_i = jax.random.fold_in(key, i)
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = (
                 idx
-                if idx.size(1) <= self.config.block_size
+                if idx.shape[1] <= self.config.block_size
                 else idx[:, -self.config.block_size :]
             )
             # forward the model to get the logits for the index in the sequence
@@ -524,14 +533,18 @@ class GPT(nnx.Module):
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float("Inf")
+                v, _ = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))
+                # v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits = jnp.where(logits < v[:, [-1]], -jnp.inf, logits)
+                # logits[logits < v[:, [-1]]] = -float("Inf")
             # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
+            # probs = jax.nn.softmax(logits, axis=-1)
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = jax.random.categorical(key=key_i, logits=logits)
+            # idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            idx, _ = pack((idx, idx_next), "B *")
+            # idx = jnp.concatenate((idx, idx_next), axis=1)
 
         return idx
 
@@ -554,12 +567,26 @@ def flatten_iter[V](
         yield (label, p)
 
 
+def chexify[C: Callable | nnx.Module](obj: C) -> C:
+    return chex.chexify(obj)  # type: ignore
+
+
 def main():
     gpt = GPT(GPTConfig(), rngs=nnx.Rngs(0))
-    gpt = nnx.jit(gpt)
+    print(f"number of parameters: {gpt.get_num_params() / 1e6:.2f}M")
+    # gpt = nnx.jit(gpt)
+    # gpt = chexify(gpt)
     x = jax.random.randint(jax.random.key(0), (1, 16), 0, gpt.config.vocab_size)
-    y = gpt(x)
-    print(y.shape)
+    logits, loss = jax.jit(gpt)(x[..., :-1], targets=x[..., 1:])
+    assert loss is not None
+    print(logits)
+    print(loss)
+    print(f"{loss.shape=}")
+    print(f"{logits.shape=}")
+    result = gpt.generate(x, 10, key=jax.random.key(0))
+    chex.block_until_chexify_assertions_complete()
+    print(f"{x=}")
+    print(f"{result=}")
 
 
 if __name__ == "__main__":

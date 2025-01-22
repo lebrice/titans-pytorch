@@ -4,7 +4,7 @@ from math import ceil
 from functools import partial
 
 import tqdm
-
+from torch import Tensor
 import torch
 from torch import nn, cat
 import torch.nn.functional as F
@@ -267,7 +267,7 @@ class SegmentedAttention(Module):
 
         orig_v = v
 
-        if exists(self.to_learned_v_mix):
+        if self.to_learned_v_mix is not None:
             mix = self.to_learned_v_mix(seq)
             v = v.lerp(value_residual, mix)
 
@@ -535,7 +535,7 @@ class MemoryAsContextTransformer(Module):
                             branch=mem,
                             add_branch_out_to_residual=not neural_mem_gate_attn_output,
                         )
-                        if exists(mem)
+                        if mem is not None
                         else None,
                         init_hyper_conn(dim=dim, branch=attn),
                         init_hyper_conn(dim=dim, branch=ff),
@@ -561,7 +561,7 @@ class MemoryAsContextTransformer(Module):
         # flex attn related
 
         assert not (
-            use_flex_attn and not exists(flex_attention)
+            use_flex_attn and flex_attention is None
         ), "you need to be on the latest pytorch with a cuda device available"
         self.use_flex_attn = use_flex_attn
 
